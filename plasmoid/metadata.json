@@ -5,7 +5,7 @@
     "Name": "Sky Status",
     "Description": "Compact astronomy conditions and tonight's observing forecast",
     "Icon": "weather-clear-night",
-    "Version": "0.2.0",
+    "Version": "0.3.0",
     "Authors": [
       {
         "Name": "Nilson Bazana"
