@@ -13,22 +13,31 @@ Clicking it opens a larger dashboard with the best observing window, evening clo
 ## Data sources
 
 - **Open-Meteo** — current temperature/humidity plus hourly total, low, mid and high cloud cover.
+- **Open-Meteo Geocoding** — location search for the configuration UI and CLI.
 - **7Timer ASTRO** — astronomical seeing and atmospheric transparency.
 - **PyEphem (local)** — astronomical dusk/dawn, Moon phase, illumination, moonrise and moonset.
 
 The network sources are cached locally, while the ephemeris calculations are local.
 
-## What changed in v0.2
+## Architecture
 
-The project is no longer built around a generic command-output Plasma widget. It now contains its own Plasma 6 plasmoid with separate compact and full representations.
+The project is split into a data backend and frontends:
 
-The backend also gained structured JSON output:
+```text
+sky-status backend
+      │
+      ├── Plasma 6 plasmoid
+      ├── future Qt tray frontend
+      └── other frontends (Waybar/Niri, etc.)
+```
+
+The backend exposes structured JSON:
 
 ```bash
 sky-status --json
 ```
 
-That keeps the data layer independent of Plasma and makes it reusable later with Waybar, Niri or other frontends.
+That keeps forecast/astronomy logic independent of any desktop environment.
 
 ## Panel view
 
@@ -83,26 +92,108 @@ Ubuntu/Kubuntu:
 sudo apt install python3-ephem
 ```
 
-Python's standard library handles HTTP and JSON, so `curl` and `jq` are no longer required by `sky-status` itself.
+Python's standard library handles HTTP, JSON and configuration, so `curl` and `jq` are no longer required by `sky-status` itself.
 
-## Location
+## Location configuration
 
-Defaults are currently set for Maringá, Paraná, Brazil:
+Users do **not** need to edit the script.
+
+On Linux the shared configuration file is:
 
 ```text
-Latitude:  -23.42
-Longitude: -51.93
-Timezone:  America/Sao_Paulo
+~/.config/sky-status/config.json
 ```
 
-Override them with environment variables:
+It contains only the location information:
+
+```json
+{
+  "name": "Maringá, Paraná, Brazil",
+  "latitude": -23.42,
+  "longitude": -51.93,
+  "timezone": "America/Sao_Paulo"
+}
+```
+
+On Windows the backend is already prepared to use:
+
+```text
+%LOCALAPPDATA%\SkyStatus\config.json
+```
+
+You can override the config path with `SKY_CONFIG`.
+
+### Plasma: search instead of typing coordinates
+
+Open **Sky Status Settings → Location**.
+
+Search for a city or town, choose a result and click **Use**. The search fills:
+
+- display name
+- latitude
+- longitude
+- IANA timezone
+
+Press **Apply**. The plasmoid then saves the same values to the shared `sky-status` config file and refreshes the forecast.
+
+Coordinates and timezone remain editable manually for precise observing sites.
+
+### CLI location search
+
+Search without saving:
+
+```bash
+sky-status --search-location "London"
+```
+
+Save the first matching result:
+
+```bash
+sky-status --set-location "London"
+```
+
+Inspect the current stored and effective configuration:
+
+```bash
+sky-status --show-config | python3 -m json.tool
+```
+
+Advanced/manual configuration:
+
+```bash
+sky-status \
+  --lat 51.5074 \
+  --lon -0.1278 \
+  --timezone Europe/London \
+  --location-name "London, England, United Kingdom" \
+  --save-config
+```
+
+### Override precedence
+
+Location values are resolved in this order:
+
+```text
+command-line option
+        ↓
+environment variable
+        ↓
+config.json
+        ↓
+built-in default
+```
+
+Environment overrides remain available:
 
 ```bash
 SKY_LAT=51.5074 \
 SKY_LON=-0.1278 \
 SKY_TZ=Europe/London \
-~/.local/bin/sky-status --json
+SKY_LOCATION_NAME="London" \
+sky-status --json
 ```
+
+The built-in fallback remains Maringá, Paraná, Brazil so an unconfigured checkout can still be tested immediately.
 
 ## Install the backend
 
@@ -214,7 +305,11 @@ sky-status
 ├── plasmoid
 │   ├── metadata.json
 │   └── contents
+│       ├── config
+│       │   ├── config.qml
+│       │   └── main.xml
 │       └── ui
+│           ├── configGeneral.qml
 │           └── main.qml
 └── README.md
 ```
