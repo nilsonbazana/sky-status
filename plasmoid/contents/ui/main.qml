@@ -11,18 +11,35 @@ PlasmoidItem {
     property var sky: ({})
     property string lastError: ""
     property bool refreshing: false
+    property bool syncingLocation: false
+    property string activeSyncCommand: ""
 
     readonly property string command: "/bin/sh -lc '$HOME/.local/bin/sky-status --json'"
     readonly property string refreshCommand: "/bin/sh -lc '$HOME/.local/bin/sky-status --json --refresh'"
+    readonly property string locationSignature: [
+        plasmoid.configuration.locationName,
+        plasmoid.configuration.latitude,
+        plasmoid.configuration.longitude,
+        plasmoid.configuration.timezone
+    ].join("|")
 
     preferredRepresentation: compactRepresentation
     activationTogglesExpanded: true
     hideOnWindowDeactivate: true
     toolTipMainText: qsTr("Sky Status")
     toolTipSubText: bestWindow()
-                        ? qsTr("Best %1 · cloud %2%").arg(bestWindow().label).arg(metricValue(bestWindow().cloud.total))
-                        : qsTr("Astronomy forecast unavailable")
+                        ? qsTr("%1 · best %2 · cloud %3%")
+                            .arg(locationName()).arg(bestWindow().label).arg(metricValue(bestWindow().cloud.total))
+                        : locationName()
 
+    function shellQuote(value) {
+        return "'" + String(value).replace(/'/g, "'\"'\"'") + "'"
+    }
+    function locationName() {
+        if (sky && sky.location && sky.location.name)
+            return sky.location.name
+        return plasmoid.configuration.locationName || qsTr("Location")
+    }
     function bestWindow() {
         return sky && sky.forecast && sky.forecast.best_window ? sky.forecast.best_window : null
     }
@@ -78,9 +95,34 @@ PlasmoidItem {
             lastError = qsTr("Could not parse sky-status JSON")
         }
     }
+
     function refresh() {
         refreshing = true
         executable.connectSource(refreshCommand)
+    }
+
+    function syncLocation() {
+        if (syncingLocation)
+            return
+        const inner = "$HOME/.local/bin/sky-status --save-config" +
+                      " --lat " + shellQuote(plasmoid.configuration.latitude) +
+                      " --lon " + shellQuote(plasmoid.configuration.longitude) +
+                      " --timezone " + shellQuote(plasmoid.configuration.timezone) +
+                      " --location-name " + shellQuote(plasmoid.configuration.locationName)
+        activeSyncCommand = "/bin/sh -lc " + shellQuote(inner)
+        syncingLocation = true
+        executable.connectSource(activeSyncCommand)
+    }
+
+    onLocationSignatureChanged: locationSyncTimer.restart()
+
+    Component.onCompleted: locationSyncTimer.start()
+
+    Timer {
+        id: locationSyncTimer
+        interval: 350
+        repeat: false
+        onTriggered: root.syncLocation()
     }
 
     Plasma5Support.DataSource {
@@ -89,6 +131,17 @@ PlasmoidItem {
         connectedSources: [root.command]
         interval: 300000
         onNewData: function(sourceName, data) {
+            if (sourceName === root.activeSyncCommand && root.activeSyncCommand.length > 0) {
+                root.syncingLocation = false
+                disconnectSource(sourceName)
+                root.activeSyncCommand = ""
+                if (data["exit code"] !== 0) {
+                    root.lastError = data["stderr"] || qsTr("Could not save location settings")
+                    return
+                }
+                root.refresh()
+                return
+            }
             if (sourceName === root.command || sourceName === root.refreshCommand)
                 root.consume(data)
             if (sourceName === root.refreshCommand)
@@ -183,7 +236,7 @@ PlasmoidItem {
                     spacing: 0
                     Kirigami.Heading { text: qsTr("Tonight"); level: 2 }
                     PlasmaComponents.Label {
-                        text: root.sky && root.sky.stale ? qsTr("Cached forecast") : qsTr("Astronomy conditions")
+                        text: root.locationName() + (root.sky && root.sky.stale ? qsTr(" · cached forecast") : "")
                         color: root.sky && root.sky.stale ? root.qualityColor(45) : Kirigami.Theme.disabledTextColor
                         font: Kirigami.Theme.smallFont
                     }
