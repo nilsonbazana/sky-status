@@ -18,6 +18,8 @@ export RUSTUP_HOME="$WORK_ROOT/rustup"
 export TMPDIR="$WORK_ROOT/tmp"
 export CARGO_TARGET_DIR="$TARGET_ROOT"
 export PATH="$CARGO_HOME/bin:$PATH"
+export DEBIAN_FRONTEND=noninteractive
+export DEBCONF_NONINTERACTIVE_SEEN=true
 LOG="$HOME/niri24-install.log"
 
 exec > >(tee -a "$LOG") 2>&1
@@ -43,8 +45,8 @@ echo "Free on $DATA_MOUNT: about ${FREE_GB} GiB"
 sudo mkdir -p "$WORK_ROOT" "$BUILD_ROOT" "$TARGET_ROOT" "$CARGO_HOME" "$RUSTUP_HOME" "$TMPDIR"
 sudo chown -R "$ME:$MYGROUP" "$WORK_ROOT"
 
-if [[ -r /sys/module/nvidia_drm/parameters/modeset ]]; then
-    NVIDIA_MODESET="$(cat /sys/module/nvidia_drm/parameters/modeset)"
+if [[ -e /sys/module/nvidia_drm/parameters/modeset ]]; then
+    NVIDIA_MODESET="$(sudo cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || echo unknown)"
     echo "NVIDIA DRM modeset: $NVIDIA_MODESET"
 else
     NVIDIA_MODESET="not-loaded"
@@ -52,9 +54,6 @@ else
 fi
 
 stage "2/10 Disable the known broken Celestia apt source"
-# The current machine has an obsolete celestiaproject.space Noble source that makes
-# apt update fail with 404/No Release file. Disable only source files containing
-# that exact hostname, and keep them under a reversible .disabled-by-niri24 name.
 sudo -v
 shopt -s nullglob
 for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
@@ -66,8 +65,6 @@ for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
         fi
     fi
 done
-# Rare case: source was manually placed in the main sources.list. Back up first,
-# then comment only matching traditional deb lines.
 if [[ -f /etc/apt/sources.list ]] && sudo grep -qi 'celestiaproject\.space' /etc/apt/sources.list; then
     sudo cp -an /etc/apt/sources.list /etc/apt/sources.list.niri24-backup
     sudo sed -i '/celestiaproject\.space/ s/^[[:space:]]*deb /# disabled-by-niri24 deb /' /etc/apt/sources.list
@@ -75,8 +72,9 @@ if [[ -f /etc/apt/sources.list ]] && sudo grep -qi 'celestiaproject\.space' /etc
 fi
 
 stage "3/10 Packages"
+printf 'gdm3 shared/default-x-display-manager select sddm\n' | sudo debconf-set-selections || true
 sudo apt-get update
-sudo apt-get install -y \
+sudo apt-get install -y --no-install-recommends \
     git curl ca-certificates build-essential gcc clang pkg-config \
     libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev \
     libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev \
@@ -85,7 +83,6 @@ sudo apt-get install -y \
     waybar fuzzel alacritty swaylock mako-notifier swaybg \
     xdg-desktop-portal-gtk xdg-desktop-portal-gnome gnome-keyring \
     policykit-1-gnome wl-clipboard brightnessctl playerctl
-# Do not leave downloaded .deb files consuming the root filesystem.
 sudo apt-get clean
 
 stage "4/10 Rust on data partition"
@@ -146,8 +143,6 @@ spawn-at-startup "/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1
 KDL
 fi
 
-# Preserve the already-installed backend if it exists. Only copy from this repo
-# when the repo's version is present and executable.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/sky-status" ]]; then
     install -Dm755 "$SCRIPT_DIR/sky-status" "$HOME/.local/bin/sky-status"
@@ -227,6 +222,7 @@ fi
 
 stage "10/10 Make SDDM start Niri"
 sudo mkdir -p /etc/sddm.conf.d
+printf '/usr/bin/sddm\n' | sudo tee /etc/X11/default-display-manager >/dev/null
 sudo tee /etc/sddm.conf.d/99-niri-recovery.conf >/dev/null <<SDDM
 [Autologin]
 User=$ME
