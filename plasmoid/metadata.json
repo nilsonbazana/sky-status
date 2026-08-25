@@ -1,0 +1,19 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Id": "io.github.nilsonbazana.skystatus",
+    "Name": "Sky Status",
+    "Description": "Compact astronomy conditions and tonight's observing forecast",
+    "Icon": "weather-clear-night",
+    "Version": "0.2.0",
+    "Authors": [
+      {
+        "Name": "Nilson Bazana"
+      }
+    ],
+    "Category": "Utilities",
+    "Website": "https://github.com/nilsonbazana/sky-status"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0",
+  "X-Plasma-NotificationAreaCategory": "SystemServices"
+}
