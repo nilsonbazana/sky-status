@@ -1,79 +1,93 @@
 # sky-status
 
-Compact weather and Moon status output for Linux desktop panels.
+`sky-status` is an astronomy-oriented status backend and native KDE Plasma 6 widget for answering a practical question: **is tonight worth observing?**
 
-`sky-status` combines current weather from Open-Meteo with locally calculated lunar data from PyEphem. It is designed for lightweight panel widgets such as KDE Plasma command-output widgets and can also be reused in Waybar or similar bars.
-
-## Example output
-
-Compact mode:
+The panel view is intentionally tiny:
 
 ```text
-20°C · 58% | 🌔 91% ↑16:05 ↓05:04
+☁ 8%   🌔 91%
 ```
 
-Long mode:
+Clicking it opens a larger dashboard with the best observing window, evening cloud layers, an hourly cloud timeline, astronomical dusk/dawn, seeing, transparency, Moon data, temperature and humidity.
 
-```text
-20°C · feels 20°C · RH 58% | 🌔 Waxing Gibbous · 91% · rise 16:05 · set 05:04
+## Data sources
+
+- **Open-Meteo** — current temperature/humidity plus hourly total, low, mid and high cloud cover.
+- **7Timer ASTRO** — astronomical seeing and atmospheric transparency.
+- **PyEphem (local)** — astronomical dusk/dawn, Moon phase, illumination, moonrise and moonset.
+
+The network sources are cached locally, while the ephemeris calculations are local.
+
+## What changed in v0.2
+
+The project is no longer built around a generic command-output Plasma widget. It now contains its own Plasma 6 plasmoid with separate compact and full representations.
+
+The backend also gained structured JSON output:
+
+```bash
+sky-status --json
 ```
 
-## Features
+That keeps the data layer independent of Plasma and makes it reusable later with Waybar, Niri or other frontends.
 
-- Current temperature
-- Relative humidity
-- Apparent temperature in long mode
-- Moon phase icon
-- Moon illumination
-- Moon phase name in long mode
-- Next moonrise
-- Next moonset
-- Five-minute weather cache
-- Graceful fallback to stale cached weather if Open-Meteo is temporarily unavailable
-- Local lunar calculations, so Moon data continues working without network access
+## Panel view
+
+The compact panel representation shows only:
+
+- tonight's best two-hour cloud-cover value
+- Moon phase icon and illumination
+
+Cloud cover is color-coded from **green (favorable)** through **amber** to **red (poor)**.
+
+## Click-open dashboard
+
+The full Plasma popup uses more screen space for:
+
+- best remaining two-hour observing window
+- total / low / mid / high evening cloud
+- up to eight hourly cloud bars
+- seeing estimate
+- transparency estimate
+- astronomical dusk and dawn
+- Moon phase, illumination, next rise and set
+- current temperature and humidity
+- manual refresh
+
+### Color scale
+
+The widget uses a restrained continuous red → amber → green text scale.
+
+The backend normalizes each metric to a 0–100 quality score, so **higher always means more favorable** before it reaches the QML frontend:
+
+- cloud: lower cloud cover = better
+- seeing: smaller 7Timer seeing category = better
+- transparency: smaller extinction category = better
+- humidity: lower humidity = better
+- temperature: a comfort-oriented scale, not an astronomy-quality measurement
+
+Moon illumination and dusk/dawn are left neutral because whether they are favorable depends on what you intend to observe.
+
+## Best-window calculation
+
+For the coming/current astronomical night, `sky-status` examines the Open-Meteo hourly forecast between astronomical dusk and dawn. If the night has already begun, elapsed hours are ignored.
+
+It then finds the best remaining two-hour block by minimizing mean total cloud cover, with a small penalty for a cloudy spike inside the block.
+
+The dashboard separately reports median cloud cover for the first five hours after astronomical dusk as the **evening cloud** summary.
 
 ## Dependencies
 
-On Ubuntu/Kubuntu:
+Ubuntu/Kubuntu:
 
 ```bash
-sudo apt install curl jq python3-ephem
+sudo apt install python3-ephem
 ```
 
-Python 3.9+ is recommended because the script uses `zoneinfo` from the standard library.
+Python's standard library handles HTTP and JSON, so `curl` and `jq` are no longer required by `sky-status` itself.
 
-## Installation
+## Location
 
-Clone the repository:
-
-```bash
-git clone https://github.com/nilsonbazana/sky-status.git
-cd sky-status
-```
-
-Install the script into your local executable path:
-
-```bash
-mkdir -p ~/.local/bin
-cp sky-status ~/.local/bin/sky-status
-chmod +x ~/.local/bin/sky-status
-```
-
-Test it:
-
-```bash
-~/.local/bin/sky-status
-```
-
-For the expanded output:
-
-```bash
-~/.local/bin/sky-status --long
-```
-
-## Location and timezone
-
-The defaults are set for Maringá, Paraná, Brazil:
+Defaults are currently set for Maringá, Paraná, Brazil:
 
 ```text
 Latitude:  -23.42
@@ -81,95 +95,129 @@ Longitude: -51.93
 Timezone:  America/Sao_Paulo
 ```
 
-You can override them without editing the script:
+Override them with environment variables:
 
 ```bash
-SKY_LAT=-23.42 SKY_LON=-51.93 SKY_TZ=America/Sao_Paulo ~/.local/bin/sky-status
+SKY_LAT=51.5074 \
+SKY_LON=-0.1278 \
+SKY_TZ=Europe/London \
+~/.local/bin/sky-status --json
 ```
 
-For another location:
+## Install the backend
 
 ```bash
-SKY_LAT=51.5074 SKY_LON=-0.1278 SKY_TZ=Europe/London ~/.local/bin/sky-status
+git clone https://github.com/nilsonbazana/sky-status.git
+cd sky-status
+
+install -Dm755 sky-status ~/.local/bin/sky-status
 ```
 
-## Weather source
+Test the compact output:
 
-Weather data comes from [Open-Meteo](https://open-meteo.com/).
+```bash
+~/.local/bin/sky-status
+```
 
-The script requests:
+Test the JSON consumed by the Plasma widget:
 
-- `temperature_2m`
-- `apparent_temperature`
-- `relative_humidity_2m`
+```bash
+~/.local/bin/sky-status --json | python3 -m json.tool
+```
 
-To avoid unnecessary API calls, weather is cached for five minutes in:
+Force a fresh network fetch:
+
+```bash
+~/.local/bin/sky-status --json --refresh
+```
+
+## Install the Plasma 6 widget
+
+From the repository directory:
+
+```bash
+kpackagetool6 --type Plasma/Applet --install plasmoid
+```
+
+For a later update:
+
+```bash
+kpackagetool6 --type Plasma/Applet --upgrade plasmoid
+```
+
+The widget ID is:
 
 ```text
-~/.cache/sky-status/weather.json
+io.github.nilsonbazana.skystatus
 ```
 
-If Open-Meteo cannot be reached but an older valid cache exists, the output is prefixed with `~`:
+### Test it safely before adding it to the panel
+
+Do this first:
+
+```bash
+plasmawindowed io.github.nilsonbazana.skystatus
+```
+
+Only after the windowed test behaves correctly should you add **Sky Status** to the Plasma panel from **Add Widgets**.
+
+This avoids using the live panel as the development/test environment.
+
+## Cache
+
+Network responses are stored in:
 
 ```text
-~20°C · 58% | 🌔 91% ↑16:05 ↓05:04
+~/.cache/sky-status/
 ```
 
-The tilde indicates stale cached weather.
+Current defaults:
 
-## Moon calculations
+- Open-Meteo: 10 minutes
+- 7Timer ASTRO: 30 minutes
 
-Lunar data is calculated locally with PyEphem.
+If a source is temporarily unavailable, a previous cached response can still be used and the dashboard marks the forecast as cached.
 
-The script determines:
+## Text modes
 
-- lunar phase
-- illuminated fraction
-- next moonrise
-- next moonset
+The backend remains useful without Plasma.
 
-The phase icons are standard Unicode Moon symbols:
+Compact:
+
+```bash
+sky-status
+```
+
+Example:
 
 ```text
-🌑 New Moon
-🌒 Waxing Crescent
-🌓 First Quarter
-🌔 Waxing Gibbous
-🌕 Full Moon
-🌖 Waning Gibbous
-🌗 Last Quarter
-🌘 Waning Crescent
+☁8%  🌔91%
 ```
 
-## KDE Plasma panel
+Long:
 
-A convenient approach is to use a Plasma widget that displays command output.
+```bash
+sky-status --long
+```
 
-Set its command to the full executable path, for example:
+Example structure:
 
 ```text
-/home/your-user/.local/bin/sky-status
+Best 20:00–22:00 · cloud 8% · seeing 1.0–1.25″ · transparency 0.4–0.5 · 🌔 91%
 ```
 
-A refresh interval of around 60 seconds works well. The script's internal cache ensures Open-Meteo is still contacted no more than once every five minutes.
-
-If the widget supports a separate tooltip command, use:
+## Repository layout
 
 ```text
-/home/your-user/.local/bin/sky-status --long
+sky-status
+├── sky-status
+├── plasmoid
+│   ├── metadata.json
+│   └── contents
+│       └── ui
+│           └── main.qml
+└── README.md
 ```
-
-This keeps the panel compact while exposing more detail on hover.
-
-## Reusing with other bars
-
-Because `sky-status` simply writes one line to stdout, it can be used with:
-
-- KDE Plasma command-output widgets
-- Waybar custom modules
-- Polybar scripts
-- shell prompts
-- desktop monitoring tools
 
 ## License
 
