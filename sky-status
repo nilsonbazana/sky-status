@@ -1,223 +1,423 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
+"""Astronomy-oriented status data for Linux panels and Plasma."""
 
-set -uo pipefail
-
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
-
-LAT="${SKY_LAT:--23.42}"
-LON="${SKY_LON:--51.93}"
-TZ_NAME="${SKY_TZ:-America/Sao_Paulo}"
-
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/sky-status"
-WEATHER_CACHE="$CACHE_DIR/weather.json"
-
-# Fetch weather at most once every 5 minutes.
-WEATHER_MAX_AGE=300
-
-MODE="compact"
-[[ "${1:-}" == "--long" ]] && MODE="long"
-
-mkdir -p "$CACHE_DIR"
-
-# ------------------------------------------------------------
-# Weather
-# ------------------------------------------------------------
-
-weather_text=""
-weather_stale=0
-
-weather_url="https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&current=temperature_2m,apparent_temperature,relative_humidity_2m&timezone=auto"
-
-validate_weather()
-{
-    local file="$1"
-
-    [[ -s "$file" ]] || return 1
-
-    jq -e '
-        (.current | type == "object") and
-        (.current.temperature_2m != null) and
-        (.current.apparent_temperature != null) and
-        (.current.relative_humidity_2m != null)
-    ' "$file" >/dev/null 2>&1
-}
-
-cache_is_fresh()
-{
-    validate_weather "$WEATHER_CACHE" || return 1
-
-    local now mtime age
-
-    now=$(date +%s)
-    mtime=$(stat -c %Y "$WEATHER_CACHE" 2>/dev/null) || return 1
-    age=$((now - mtime))
-
-    (( age < WEATHER_MAX_AGE ))
-}
-
-refresh_weather()
-{
-    local tmp="${WEATHER_CACHE}.tmp.$$"
-
-    # Download the actual Open-Meteo JSON first.
-    if ! curl \
-        --fail \
-        --silent \
-        --show-error \
-        --location \
-        --connect-timeout 3 \
-        --max-time 6 \
-        --retry 1 \
-        "$weather_url" \
-        -o "$tmp"
-    then
-        rm -f "$tmp"
-        return 1
-    fi
-
-    # Validate it without replacing the JSON with jq's true/false output.
-    if validate_weather "$tmp"; then
-        mv "$tmp" "$WEATHER_CACHE"
-        return 0
-    fi
-
-    rm -f "$tmp"
-    return 1
-}
-
-# Remove any malformed cache left by an older version.
-if [[ -e "$WEATHER_CACHE" ]] && ! validate_weather "$WEATHER_CACHE"; then
-    rm -f "$WEATHER_CACHE"
-fi
-
-if ! cache_is_fresh; then
-    if ! refresh_weather; then
-        # If Open-Meteo is temporarily unavailable, keep using an older valid cache.
-        if validate_weather "$WEATHER_CACHE"; then
-            weather_stale=1
-        fi
-    fi
-fi
-
-if validate_weather "$WEATHER_CACHE"; then
-
-    if [[ "$MODE" == "long" ]]; then
-        weather_text=$(
-            jq -r '
-                "\(.current.temperature_2m | round)°C" +
-                " · feels \(.current.apparent_temperature | round)°C" +
-                " · RH \(.current.relative_humidity_2m | round)%"
-            ' "$WEATHER_CACHE"
-        )
-    else
-        weather_text=$(
-            jq -r '
-                "\(.current.temperature_2m | round)°C" +
-                " · \(.current.relative_humidity_2m | round)%"
-            ' "$WEATHER_CACHE"
-        )
-    fi
-
-    # "~" means the weather reading came from an older cache.
-    (( weather_stale )) && weather_text="~${weather_text}"
-else
-    weather_text="--°C"
-fi
-
-# ------------------------------------------------------------
-# Moon
-# ------------------------------------------------------------
-
-moon_text=$(
-    SKY_LAT="$LAT" \
-    SKY_LON="$LON" \
-    SKY_TZ="$TZ_NAME" \
-    SKY_MODE="$MODE" \
-    python3 2>/dev/null <<'PY'
+import argparse
+import json
+import math
 import os
-from datetime import timezone
+import statistics
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 try:
     import ephem
 except ImportError:
-    print("🌙 --")
-    raise SystemExit
+    ephem = None
 
-lat = os.environ["SKY_LAT"]
-lon = os.environ["SKY_LON"]
-tz_name = os.environ["SKY_TZ"]
-mode = os.environ.get("SKY_MODE", "compact")
+LAT = float(os.environ.get("SKY_LAT", "-23.42"))
+LON = float(os.environ.get("SKY_LON", "-51.93"))
+TZ_NAME = os.environ.get("SKY_TZ", "America/Sao_Paulo")
+TZ = ZoneInfo(TZ_NAME)
 
-tz = ZoneInfo(tz_name)
-now = ephem.now()
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "sky-status"
+OPENMETEO_CACHE = CACHE_DIR / "open-meteo.json"
+SEVENTIMER_CACHE = CACHE_DIR / "7timer.json"
+OPENMETEO_MAX_AGE = 10 * 60
+SEVENTIMER_MAX_AGE = 30 * 60
+HTTP_TIMEOUT = 7
+BEST_WINDOW_HOURS = 2
 
-# Lunar phase
-previous_new = ephem.previous_new_moon(now)
-next_new = ephem.next_new_moon(now)
-
-lunation = float(next_new - previous_new)
-age = float(now - previous_new)
-fraction = age / lunation
-
-phases = [
-    ("🌑", "New Moon"),
-    ("🌒", "Waxing Crescent"),
-    ("🌓", "First Quarter"),
-    ("🌔", "Waxing Gibbous"),
-    ("🌕", "Full Moon"),
-    ("🌖", "Waning Gibbous"),
-    ("🌗", "Last Quarter"),
-    ("🌘", "Waning Crescent"),
+SEEING_LABELS = {
+    1: "<0.5″", 2: "0.5–0.75″", 3: "0.75–1.0″", 4: "1.0–1.25″",
+    5: "1.25–1.5″", 6: "1.5–2.0″", 7: "2.0–2.5″", 8: ">2.5″",
+}
+TRANSPARENCY_LABELS = {
+    1: "<0.3", 2: "0.3–0.4", 3: "0.4–0.5", 4: "0.5–0.6",
+    5: "0.6–0.7", 6: "0.7–0.85", 7: "0.85–1.0", 8: ">1.0",
+}
+PHASES = [
+    ("🌑", "New Moon"), ("🌒", "Waxing Crescent"), ("🌓", "First Quarter"),
+    ("🌔", "Waxing Gibbous"), ("🌕", "Full Moon"), ("🌖", "Waning Gibbous"),
+    ("🌗", "Last Quarter"), ("🌘", "Waning Crescent"),
 ]
 
-index = int(fraction * 8 + 0.5) % 8
-icon, phase_name = phases[index]
 
-moon = ephem.Moon(now)
-illumination = round(moon.phase)
-
-# Moonrise / moonset
-observer = ephem.Observer()
-observer.lat = lat
-observer.lon = lon
+def clamp(value, low=0.0, high=100.0):
+    return max(low, min(high, value))
 
 
-def local_time(ephem_date):
-    dt = ephem_date.datetime()
-    dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(tz).strftime("%H:%M")
+def quality_inverse_percent(value):
+    return None if value is None else round(clamp(100.0 - float(value)))
 
 
-try:
-    rise = local_time(observer.next_rising(ephem.Moon()))
-except (ephem.AlwaysUpError, ephem.NeverUpError):
-    rise = "--:--"
+def quality_1_to_8(index):
+    if index is None:
+        return None
+    return round(clamp(100.0 - ((float(index) - 1.0) / 7.0) * 100.0))
 
-try:
-    setting = local_time(observer.next_setting(ephem.Moon()))
-except (ephem.AlwaysUpError, ephem.NeverUpError):
-    setting = "--:--"
 
-# Output
-if mode == "long":
-    print(
-        f"{icon} {phase_name} · {illumination}% "
-        f"· rise {rise} · set {setting}"
+def temperature_comfort_quality(temp_c):
+    """Comfort-oriented score; it is not an astronomy-quality metric."""
+    if temp_c is None:
+        return None
+    t = float(temp_c)
+    if 15 <= t <= 24:
+        return 100
+    if t < 15:
+        return round(clamp(100 - (15 - t) * 9))
+    return round(clamp(100 - (t - 24) * 11))
+
+
+def humidity_quality(rh):
+    if rh is None:
+        return None
+    h = float(rh)
+    if h <= 60:
+        return 100
+    if h >= 95:
+        return 0
+    return round(clamp(100 - (h - 60) * (100 / 35)))
+
+
+def read_cache(path, max_age):
+    try:
+        age = time.time() - path.stat().st_mtime
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh), age > max_age
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None, True
+
+
+def atomic_write_json(path, data):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(CACHE_DIR))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def fetch_json(url, cache_path, max_age, force=False):
+    cached, stale = read_cache(cache_path, max_age)
+    if cached is not None and not stale and not force:
+        return cached, False
+
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "sky-status/2.0 (+https://github.com/nilsonbazana/sky-status)"},
     )
-else:
-    print(
-        f"{icon} {illumination}% ↑{rise} ↓{setting}"
-    )
-PY
-)
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            data = json.load(response)
+        atomic_write_json(cache_path, data)
+        return data, False
+    except Exception:
+        if cached is not None:
+            return cached, True
+        return None, True
 
-[[ -z "$moon_text" ]] && moon_text="🌙 --"
 
-# ------------------------------------------------------------
-# Final status line
-# ------------------------------------------------------------
+def open_meteo_url():
+    params = {
+        "latitude": f"{LAT:.4f}",
+        "longitude": f"{LON:.4f}",
+        "current": "temperature_2m,relative_humidity_2m",
+        "hourly": (
+            "temperature_2m,relative_humidity_2m,cloud_cover,"
+            "cloud_cover_low,cloud_cover_mid,cloud_cover_high"
+        ),
+        "timezone": TZ_NAME,
+        "forecast_days": "3",
+    }
+    return "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(params)
 
-printf '%s | %s\n' "$weather_text" "$moon_text"
+
+def seventimer_url():
+    params = {
+        "lon": f"{LON:.3f}", "lat": f"{LAT:.3f}",
+        "product": "astro", "output": "json",
+    }
+    return "https://www.7timer.info/bin/api.pl?" + urllib.parse.urlencode(params)
+
+
+def ephem_to_local(value):
+    return value.datetime().replace(tzinfo=timezone.utc).astimezone(TZ)
+
+
+def astronomical_night(now_local):
+    if ephem is None:
+        return None, None
+
+    obs = ephem.Observer()
+    obs.lat = str(LAT)
+    obs.lon = str(LON)
+    obs.horizon = "-18"
+    now_utc = now_local.astimezone(timezone.utc)
+    obs.date = ephem.Date(now_utc.replace(tzinfo=None))
+    sun = ephem.Sun()
+
+    prev_dusk = obs.previous_setting(sun, use_center=True)
+    prev_dawn = obs.previous_rising(sun, use_center=True)
+    next_dusk = obs.next_setting(sun, use_center=True)
+    next_dawn = obs.next_rising(sun, use_center=True)
+
+    if float(prev_dusk) > float(prev_dawn):
+        dusk, dawn = prev_dusk, next_dawn
+    else:
+        dusk = next_dusk
+        future = ephem.Observer()
+        future.lat = str(LAT)
+        future.lon = str(LON)
+        future.horizon = "-18"
+        future.date = ephem.Date(float(dusk) + 1.0 / 86400.0)
+        dawn = future.next_rising(ephem.Sun(), use_center=True)
+
+    return ephem_to_local(dusk), ephem_to_local(dawn)
+
+
+def moon_data(now_local):
+    if ephem is None:
+        return {"available": False, "icon": "🌙", "illumination": None,
+                "phase": "Unavailable", "rise": None, "set": None}
+
+    now_ephem = ephem.Date(now_local.astimezone(timezone.utc).replace(tzinfo=None))
+    previous_new = ephem.previous_new_moon(now_ephem)
+    next_new = ephem.next_new_moon(now_ephem)
+    fraction = float(now_ephem - previous_new) / float(next_new - previous_new)
+    icon, phase_name = PHASES[int(fraction * 8 + 0.5) % 8]
+    moon = ephem.Moon(now_ephem)
+
+    obs = ephem.Observer()
+    obs.lat = str(LAT)
+    obs.lon = str(LON)
+    obs.date = now_ephem
+
+    def next_event(method):
+        try:
+            return ephem_to_local(method(ephem.Moon())).strftime("%H:%M")
+        except (ephem.AlwaysUpError, ephem.NeverUpError):
+            return None
+
+    return {
+        "available": True,
+        "icon": icon,
+        "illumination": round(moon.phase),
+        "phase": phase_name,
+        "rise": next_event(obs.next_rising),
+        "set": next_event(obs.next_setting),
+    }
+
+
+def parse_open_meteo_hours(weather):
+    if not weather or "hourly" not in weather:
+        return []
+    h = weather["hourly"]
+    keys = ["time", "temperature_2m", "relative_humidity_2m", "cloud_cover",
+            "cloud_cover_low", "cloud_cover_mid", "cloud_cover_high"]
+    if not all(k in h for k in keys):
+        return []
+
+    rows = []
+    for values in zip(*(h[k] for k in keys)):
+        t, temp, rh, total, low, mid, high = values
+        dt = datetime.fromisoformat(t)
+        dt = dt.replace(tzinfo=TZ) if dt.tzinfo is None else dt.astimezone(TZ)
+        rows.append({"dt": dt, "temperature": temp, "humidity": rh,
+                     "total": total, "low": low, "mid": mid, "high": high})
+    return rows
+
+
+def median_metric(rows, key):
+    vals = [r[key] for r in rows if r.get(key) is not None]
+    return round(statistics.median(vals)) if vals else None
+
+
+def cloud_summary(rows):
+    return {key: median_metric(rows, key) for key in ("total", "low", "mid", "high")}
+
+
+def find_best_window(night_rows):
+    if not night_rows:
+        return None
+    width = min(BEST_WINDOW_HOURS, len(night_rows))
+    best, best_score = None, math.inf
+    for i in range(len(night_rows) - width + 1):
+        group = night_rows[i:i + width]
+        totals = [r["total"] for r in group if r["total"] is not None]
+        if not totals:
+            continue
+        score = statistics.mean(totals) + 0.15 * max(totals)
+        if score < best_score:
+            best_score, best = score, group
+    if not best:
+        return None
+    start = best[0]["dt"]
+    end = best[-1]["dt"] + timedelta(hours=1)
+    return {"start_dt": start, "end_dt": end,
+            "label": f"{start:%H:%M}–{end:%H:%M}", "cloud": cloud_summary(best)}
+
+
+def parse_7timer_init(value):
+    s = str(value)
+    for fmt in ("%Y%m%d%H", "%Y%m%d%H%M"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def astro_forecast(seventimer, target_local):
+    unavailable = {"available": False, "seeing": None, "transparency": None}
+    if not seventimer or not target_local:
+        return unavailable
+    init = parse_7timer_init(seventimer.get("init"))
+    series = seventimer.get("dataseries") or []
+    if init is None or not series:
+        return unavailable
+
+    target_utc = target_local.astimezone(timezone.utc)
+    point_dt = lambda p: init + timedelta(hours=float(p.get("timepoint", 0)))
+    point = min(series, key=lambda p: abs((point_dt(p) - target_utc).total_seconds()))
+
+    try:
+        seeing_idx = int(point.get("seeing"))
+    except (TypeError, ValueError):
+        seeing_idx = None
+    try:
+        trans_idx = int(point.get("transparency"))
+    except (TypeError, ValueError):
+        trans_idx = None
+
+    return {
+        "available": seeing_idx is not None or trans_idx is not None,
+        "time": point_dt(point).astimezone(TZ).isoformat(timespec="minutes"),
+        "seeing": {"index": seeing_idx, "label": SEEING_LABELS.get(seeing_idx, "—"),
+                   "quality": quality_1_to_8(seeing_idx)},
+        "transparency": {"index": trans_idx, "label": TRANSPARENCY_LABELS.get(trans_idx, "—"),
+                         "unit": "mag/airmass", "quality": quality_1_to_8(trans_idx)},
+    }
+
+
+def enrich_cloud(cloud):
+    return {key: {"value": value, "quality": quality_inverse_percent(value)}
+            for key, value in cloud.items()}
+
+
+def build_status(force=False):
+    now = datetime.now(TZ)
+    dusk, dawn = astronomical_night(now)
+    weather, weather_stale = fetch_json(open_meteo_url(), OPENMETEO_CACHE,
+                                        OPENMETEO_MAX_AGE, force=force)
+    seven, seven_stale = fetch_json(seventimer_url(), SEVENTIMER_CACHE,
+                                    SEVENTIMER_MAX_AGE, force=force)
+    rows = parse_open_meteo_hours(weather)
+
+    night_rows, evening_rows = [], []
+    if dusk and dawn:
+        start = max(now, dusk) if dusk <= now <= dawn else dusk
+        night_rows = [r for r in rows if start <= r["dt"] <= dawn]
+        evening_end = min(dawn, dusk + timedelta(hours=5))
+        evening_rows = [r for r in rows if dusk <= r["dt"] <= evening_end]
+
+    best = find_best_window(night_rows)
+    if best:
+        target = best["start_dt"] + (best["end_dt"] - best["start_dt"]) / 2
+    elif dusk and dawn:
+        target = dusk + (dawn - dusk) / 2
+    else:
+        target = now
+    astro = astro_forecast(seven, target)
+
+    current = (weather or {}).get("current", {})
+    temp = current.get("temperature_2m")
+    rh = current.get("relative_humidity_2m")
+    empty_cloud = {"total": None, "low": None, "mid": None, "high": None}
+    evening_cloud = cloud_summary(evening_rows) if evening_rows else empty_cloud
+
+    best_public = None
+    if best:
+        best_public = {
+            "start": best["start_dt"].isoformat(timespec="minutes"),
+            "end": best["end_dt"].isoformat(timespec="minutes"),
+            "label": best["label"],
+            "cloud": enrich_cloud(best["cloud"]),
+        }
+
+    timeline = [{"time": r["dt"].strftime("%H:%M"), "cloud": r["total"],
+                 "quality": quality_inverse_percent(r["total"])} for r in night_rows[:8]]
+
+    return {
+        "version": 2,
+        "generated_at": now.isoformat(timespec="seconds"),
+        "location": {"latitude": LAT, "longitude": LON, "timezone": TZ_NAME},
+        "stale": bool(weather_stale or seven_stale),
+        "sources": {"open_meteo_stale": weather_stale, "seventimer_stale": seven_stale},
+        "darkness": {"available": dusk is not None and dawn is not None,
+                     "dusk": dusk.strftime("%H:%M") if dusk else None,
+                     "dawn": dawn.strftime("%H:%M") if dawn else None},
+        "forecast": {"best_window": best_public, "evening_cloud": enrich_cloud(evening_cloud),
+                     "hours": timeline},
+        "astro": astro,
+        "moon": moon_data(now),
+        "weather": {
+            "temperature": {"value": round(temp) if temp is not None else None,
+                            "unit": "°C", "quality": temperature_comfort_quality(temp)},
+            "humidity": {"value": round(rh) if rh is not None else None,
+                         "unit": "%", "quality": humidity_quality(rh)},
+        },
+    }
+
+
+def value_or_dash(value):
+    return "—" if value is None else str(value)
+
+
+def print_compact(status):
+    best = status["forecast"]["best_window"]
+    cloud = best["cloud"]["total"]["value"] if best else None
+    moon = status["moon"]
+    stale = "~" if status["stale"] else ""
+    print(f"☁{stale}{value_or_dash(cloud)}%  {moon.get('icon', '🌙')}{value_or_dash(moon.get('illumination'))}%")
+
+
+def print_long(status):
+    best = status["forecast"]["best_window"]
+    cloud = best["cloud"]["total"]["value"] if best else None
+    window = best["label"] if best else "—"
+    seeing = (status["astro"].get("seeing") or {}).get("label", "—")
+    transparency = (status["astro"].get("transparency") or {}).get("label", "—")
+    moon = status["moon"]
+    print(f"Best {window} · cloud {value_or_dash(cloud)}% · seeing {seeing} · "
+          f"transparency {transparency} · {moon.get('icon', '🌙')} {value_or_dash(moon.get('illumination'))}%")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Astronomy-oriented status for Linux panels.")
+    parser.add_argument("--json", action="store_true", help="emit structured JSON")
+    parser.add_argument("--long", action="store_true", help="emit a longer text summary")
+    parser.add_argument("--refresh", action="store_true", help="ignore fresh caches once")
+    args = parser.parse_args()
+    status = build_status(force=args.refresh)
+    if args.json:
+        json.dump(status, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+        sys.stdout.write("\n")
+    elif args.long:
+        print_long(status)
+    else:
+        print_compact(status)
+
+
+if __name__ == "__main__":
+    main()
