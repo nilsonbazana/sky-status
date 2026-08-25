@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+
+LAT="${SKY_LAT:--23.42}"
+LON="${SKY_LON:--51.93}"
+TZ_NAME="${SKY_TZ:-America/Sao_Paulo}"
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/sky-status"
+WEATHER_CACHE="$CACHE_DIR/weather.json"
+
+# Fetch weather at most once every 5 minutes.
+WEATHER_MAX_AGE=300
+
+MODE="compact"
+[[ "${1:-}" == "--long" ]] && MODE="long"
+
+mkdir -p "$CACHE_DIR"
+
+# ------------------------------------------------------------
+# Weather
+# ------------------------------------------------------------
+
+weather_text=""
+weather_stale=0
+
+weather_url="https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&current=temperature_2m,apparent_temperature,relative_humidity_2m&timezone=auto"
+
+validate_weather()
+{
+    local file="$1"
+
+    [[ -s "$file" ]] || return 1
+
+    jq -e '
+        (.current | type == "object") and
+        (.current.temperature_2m != null) and
+        (.current.apparent_temperature != null) and
+        (.current.relative_humidity_2m != null)
+    ' "$file" >/dev/null 2>&1
+}
+
+cache_is_fresh()
+{
+    validate_weather "$WEATHER_CACHE" || return 1
+
+    local now mtime age
+
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$WEATHER_CACHE" 2>/dev/null) || return 1
+    age=$((now - mtime))
+
+    (( age < WEATHER_MAX_AGE ))
+}
+
+refresh_weather()
+{
+    local tmp="${WEATHER_CACHE}.tmp.$$"
+
+    # Download the actual Open-Meteo JSON first.
+    if ! curl \
+        --fail \
+        --silent \
+        --show-error \
+        --location \
+        --connect-timeout 3 \
+        --max-time 6 \
+        --retry 1 \
+        "$weather_url" \
+        -o "$tmp"
+    then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # Validate it without replacing the JSON with jq's true/false output.
+    if validate_weather "$tmp"; then
+        mv "$tmp" "$WEATHER_CACHE"
+        return 0
+    fi
+
+    rm -f "$tmp"
+    return 1
+}
+
+# Remove any malformed cache left by an older version.
+if [[ -e "$WEATHER_CACHE" ]] && ! validate_weather "$WEATHER_CACHE"; then
+    rm -f "$WEATHER_CACHE"
+fi
+
+if ! cache_is_fresh; then
+    if ! refresh_weather; then
+        # If Open-Meteo is temporarily unavailable, keep using an older valid cache.
+        if validate_weather "$WEATHER_CACHE"; then
+            weather_stale=1
+        fi
+    fi
+fi
+
+if validate_weather "$WEATHER_CACHE"; then
+
+    if [[ "$MODE" == "long" ]]; then
+        weather_text=$(
+            jq -r '
+                "\(.current.temperature_2m | round)°C" +
+                " · feels \(.current.apparent_temperature | round)°C" +
+                " · RH \(.current.relative_humidity_2m | round)%"
+            ' "$WEATHER_CACHE"
+        )
+    else
+        weather_text=$(
+            jq -r '
+                "\(.current.temperature_2m | round)°C" +
+                " · \(.current.relative_humidity_2m | round)%"
+            ' "$WEATHER_CACHE"
+        )
+    fi
+
+    # "~" means the weather reading came from an older cache.
+    (( weather_stale )) && weather_text="~${weather_text}"
+else
+    weather_text="--°C"
+fi
+
+# ------------------------------------------------------------
+# Moon
+# ------------------------------------------------------------
+
+moon_text=$(
+    SKY_LAT="$LAT" \
+    SKY_LON="$LON" \
+    SKY_TZ="$TZ_NAME" \
+    SKY_MODE="$MODE" \
+    python3 2>/dev/null <<'PY'
+import os
+from datetime import timezone
+from zoneinfo import ZoneInfo
+
+try:
+    import ephem
+except ImportError:
+    print("🌙 --")
+    raise SystemExit
+
+lat = os.environ["SKY_LAT"]
+lon = os.environ["SKY_LON"]
+tz_name = os.environ["SKY_TZ"]
+mode = os.environ.get("SKY_MODE", "compact")
+
+tz = ZoneInfo(tz_name)
+now = ephem.now()
+
+# Lunar phase
+previous_new = ephem.previous_new_moon(now)
+next_new = ephem.next_new_moon(now)
+
+lunation = float(next_new - previous_new)
+age = float(now - previous_new)
+fraction = age / lunation
+
+phases = [
+    ("🌑", "New Moon"),
+    ("🌒", "Waxing Crescent"),
+    ("🌓", "First Quarter"),
+    ("🌔", "Waxing Gibbous"),
+    ("🌕", "Full Moon"),
+    ("🌖", "Waning Gibbous"),
+    ("🌗", "Last Quarter"),
+    ("🌘", "Waning Crescent"),
+]
+
+index = int(fraction * 8 + 0.5) % 8
+icon, phase_name = phases[index]
+
+moon = ephem.Moon(now)
+illumination = round(moon.phase)
+
+# Moonrise / moonset
+observer = ephem.Observer()
+observer.lat = lat
+observer.lon = lon
+
+
+def local_time(ephem_date):
+    dt = ephem_date.datetime()
+    dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).strftime("%H:%M")
+
+
+try:
+    rise = local_time(observer.next_rising(ephem.Moon()))
+except (ephem.AlwaysUpError, ephem.NeverUpError):
+    rise = "--:--"
+
+try:
+    setting = local_time(observer.next_setting(ephem.Moon()))
+except (ephem.AlwaysUpError, ephem.NeverUpError):
+    setting = "--:--"
+
+# Output
+if mode == "long":
+    print(
+        f"{icon} {phase_name} · {illumination}% "
+        f"· rise {rise} · set {setting}"
+    )
+else:
+    print(
+        f"{icon} {illumination}% ↑{rise} ↓{setting}"
+    )
+PY
+)
+
+[[ -z "$moon_text" ]] && moon_text="🌙 --"
+
+# ------------------------------------------------------------
+# Final status line
+# ------------------------------------------------------------
+
+printf '%s | %s\n' "$weather_text" "$moon_text"
