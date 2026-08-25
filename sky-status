@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Astronomy-oriented status data for Linux panels and Plasma."""
+"""Astronomy-oriented status data for Linux panels, Plasma, and other frontends."""
 
 import argparse
 import json
@@ -13,17 +13,19 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     import ephem
 except ImportError:
     ephem = None
 
-LAT = float(os.environ.get("SKY_LAT", "-23.42"))
-LON = float(os.environ.get("SKY_LON", "-51.93"))
-TZ_NAME = os.environ.get("SKY_TZ", "America/Sao_Paulo")
-TZ = ZoneInfo(TZ_NAME)
+DEFAULT_LOCATION = {
+    "name": "Maringá, Paraná, Brazil",
+    "latitude": -23.42,
+    "longitude": -51.93,
+    "timezone": "America/Sao_Paulo",
+}
 
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "sky-status"
 OPENMETEO_CACHE = CACHE_DIR / "open-meteo.json"
@@ -32,6 +34,13 @@ OPENMETEO_MAX_AGE = 10 * 60
 SEVENTIMER_MAX_AGE = 30 * 60
 HTTP_TIMEOUT = 7
 BEST_WINDOW_HOURS = 2
+
+LAT = DEFAULT_LOCATION["latitude"]
+LON = DEFAULT_LOCATION["longitude"]
+TZ_NAME = DEFAULT_LOCATION["timezone"]
+TZ = ZoneInfo(TZ_NAME)
+LOCATION_NAME = DEFAULT_LOCATION["name"]
+LOCATION_SOURCE = "default"
 
 SEEING_LABELS = {
     1: "<0.5″", 2: "0.5–0.75″", 3: "0.75–1.0″", 4: "1.0–1.25″",
@@ -46,6 +55,20 @@ PHASES = [
     ("🌔", "Waxing Gibbous"), ("🌕", "Full Moon"), ("🌖", "Waning Gibbous"),
     ("🌗", "Last Quarter"), ("🌘", "Waning Crescent"),
 ]
+
+
+def config_path():
+    override = os.environ.get("SKY_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        return base / "SkyStatus" / "config.json"
+    base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    return base / "sky-status" / "config.json"
+
+
+CONFIG_FILE = config_path()
 
 
 def clamp(value, low=0.0, high=100.0):
@@ -85,6 +108,131 @@ def humidity_quality(rh):
     return round(clamp(100 - (h - 60) * (100 / 35)))
 
 
+def atomic_write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def load_user_config():
+    try:
+        with CONFIG_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def parse_float(value, field):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid {field}: {value!r}") from None
+
+
+def validate_location(latitude, longitude, timezone_name):
+    lat = parse_float(latitude, "latitude")
+    lon = parse_float(longitude, "longitude")
+    if not -90 <= lat <= 90:
+        raise ValueError("Latitude must be between -90 and 90.")
+    if not -180 <= lon <= 180:
+        raise ValueError("Longitude must be between -180 and 180.")
+    try:
+        zone = ZoneInfo(str(timezone_name))
+    except ZoneInfoNotFoundError:
+        raise ValueError(f"Unknown timezone: {timezone_name}") from None
+    return lat, lon, str(timezone_name), zone
+
+
+def resolve_location(args):
+    """Resolve CLI > environment > config file > built-in defaults."""
+    global LAT, LON, TZ_NAME, TZ, LOCATION_NAME, LOCATION_SOURCE
+
+    cfg = load_user_config()
+    values = {}
+    sources = {}
+    specs = (
+        ("latitude", args.lat, os.environ.get("SKY_LAT"), cfg.get("latitude"), DEFAULT_LOCATION["latitude"]),
+        ("longitude", args.lon, os.environ.get("SKY_LON"), cfg.get("longitude"), DEFAULT_LOCATION["longitude"]),
+        ("timezone", args.timezone, os.environ.get("SKY_TZ"), cfg.get("timezone"), DEFAULT_LOCATION["timezone"]),
+        ("name", args.location_name, os.environ.get("SKY_LOCATION_NAME"), cfg.get("name"), DEFAULT_LOCATION["name"]),
+    )
+    for key, cli_value, env_value, cfg_value, default_value in specs:
+        if cli_value not in (None, ""):
+            values[key], sources[key] = cli_value, "cli"
+        elif env_value not in (None, ""):
+            values[key], sources[key] = env_value, "environment"
+        elif cfg_value not in (None, ""):
+            values[key], sources[key] = cfg_value, "config"
+        else:
+            values[key], sources[key] = default_value, "default"
+
+    LAT, LON, TZ_NAME, TZ = validate_location(values["latitude"], values["longitude"], values["timezone"])
+    LOCATION_NAME = str(values["name"] or f"{LAT:.4f}, {LON:.4f}")
+    source_set = set(sources.values())
+    LOCATION_SOURCE = next(iter(source_set)) if len(source_set) == 1 else "mixed"
+
+    return {
+        "name": LOCATION_NAME,
+        "latitude": LAT,
+        "longitude": LON,
+        "timezone": TZ_NAME,
+        "source": LOCATION_SOURCE,
+        "field_sources": sources,
+    }
+
+
+def save_effective_location(location):
+    data = {
+        "name": location["name"],
+        "latitude": location["latitude"],
+        "longitude": location["longitude"],
+        "timezone": location["timezone"],
+    }
+    atomic_write_json(CONFIG_FILE, data)
+    return data
+
+
+def search_locations(query, count=8):
+    params = {
+        "name": query,
+        "count": str(max(1, min(20, int(count)))),
+        "language": "en",
+        "format": "json",
+    }
+    url = "https://geocoding-api.open-meteo.com/v1/search?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "sky-status/2.1 (+https://github.com/nilsonbazana/sky-status)"},
+    )
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        payload = json.load(response)
+
+    results = []
+    for item in payload.get("results", []) or []:
+        name_parts = [item.get("name"), item.get("admin1"), item.get("country")]
+        display_name = ", ".join(str(x) for x in name_parts if x)
+        results.append({
+            "display_name": display_name,
+            "name": item.get("name") or display_name,
+            "admin1": item.get("admin1"),
+            "country": item.get("country"),
+            "latitude": item.get("latitude"),
+            "longitude": item.get("longitude"),
+            "timezone": item.get("timezone"),
+        })
+    return results
+
+
 def read_cache(path, max_age):
     try:
         age = time.time() - path.stat().st_mtime
@@ -94,20 +242,6 @@ def read_cache(path, max_age):
         return None, True
 
 
-def atomic_write_json(path, data):
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(CACHE_DIR))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
-        os.replace(tmp_name, path)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-
-
 def fetch_json(url, cache_path, max_age, force=False):
     cached, stale = read_cache(cache_path, max_age)
     if cached is not None and not stale and not force:
@@ -115,7 +249,7 @@ def fetch_json(url, cache_path, max_age, force=False):
 
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "sky-status/2.0 (+https://github.com/nilsonbazana/sky-status)"},
+        headers={"User-Agent": "sky-status/2.1 (+https://github.com/nilsonbazana/sky-status)"},
     )
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
@@ -288,7 +422,10 @@ def astro_forecast(seventimer, target_local):
         return unavailable
 
     target_utc = target_local.astimezone(timezone.utc)
-    point_dt = lambda p: init + timedelta(hours=float(p.get("timepoint", 0)))
+
+    def point_dt(point):
+        return init + timedelta(hours=float(point.get("timepoint", 0)))
+
     point = min(series, key=lambda p: abs((point_dt(p) - target_utc).total_seconds()))
 
     try:
@@ -361,7 +498,14 @@ def build_status(force=False):
     return {
         "version": 2,
         "generated_at": now.isoformat(timespec="seconds"),
-        "location": {"latitude": LAT, "longitude": LON, "timezone": TZ_NAME},
+        "location": {
+            "name": LOCATION_NAME,
+            "latitude": LAT,
+            "longitude": LON,
+            "timezone": TZ_NAME,
+            "source": LOCATION_SOURCE,
+            "config_file": str(CONFIG_FILE),
+        },
         "stale": bool(weather_stale or seven_stale),
         "sources": {"open_meteo_stale": weather_stale, "seventimer_stale": seven_stale},
         "darkness": {"available": dusk is not None and dawn is not None,
@@ -403,12 +547,76 @@ def print_long(status):
           f"transparency {transparency} · {moon.get('icon', '🌙')} {value_or_dash(moon.get('illumination'))}%")
 
 
-def main():
+def parser_with_location_options():
     parser = argparse.ArgumentParser(description="Astronomy-oriented status for Linux panels.")
     parser.add_argument("--json", action="store_true", help="emit structured JSON")
     parser.add_argument("--long", action="store_true", help="emit a longer text summary")
-    parser.add_argument("--refresh", action="store_true", help="ignore fresh caches once")
+    parser.add_argument("--refresh", action="store_true", help="ignore fresh forecast caches once")
+    parser.add_argument("--lat", type=float, help="latitude override")
+    parser.add_argument("--lon", type=float, help="longitude override")
+    parser.add_argument("--timezone", help="IANA timezone override, e.g. Europe/London")
+    parser.add_argument("--location-name", help="human-readable location label")
+    parser.add_argument("--save-config", action="store_true",
+                        help="save the effective location to the user config file and exit")
+    parser.add_argument("--show-config", action="store_true",
+                        help="show config path and effective location as JSON and exit")
+    parser.add_argument("--search-location", metavar="QUERY",
+                        help="search Open-Meteo geocoding and return candidates as JSON")
+    parser.add_argument("--search-count", type=int, default=8,
+                        help="maximum geocoding results (default: 8)")
+    parser.add_argument("--set-location", metavar="QUERY",
+                        help="save the first matching geocoded location and exit")
+    return parser
+
+
+def main():
+    parser = parser_with_location_options()
     args = parser.parse_args()
+
+    if args.search_location:
+        try:
+            results = search_locations(args.search_location, args.search_count)
+        except Exception as exc:
+            parser.error(f"location search failed: {exc}")
+        json.dump({"query": args.search_location, "results": results},
+                  sys.stdout, ensure_ascii=False, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return
+
+    if args.set_location:
+        try:
+            results = search_locations(args.set_location, 1)
+        except Exception as exc:
+            parser.error(f"location search failed: {exc}")
+        if not results:
+            parser.error("no matching location found")
+        result = results[0]
+        args.lat = result["latitude"]
+        args.lon = result["longitude"]
+        args.timezone = result["timezone"]
+        args.location_name = result["display_name"]
+
+    try:
+        location = resolve_location(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if args.save_config or args.set_location:
+        saved = save_effective_location(location)
+        json.dump({"config_file": str(CONFIG_FILE), "saved": saved},
+                  sys.stdout, ensure_ascii=False, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return
+
+    if args.show_config:
+        json.dump({
+            "config_file": str(CONFIG_FILE),
+            "stored": load_user_config(),
+            "effective": location,
+        }, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return
+
     status = build_status(force=args.refresh)
     if args.json:
         json.dump(status, sys.stdout, ensure_ascii=False, separators=(",", ":"))
