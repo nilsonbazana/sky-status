@@ -94,6 +94,9 @@ if ! grep -q 'sky-status niri helper' "$HOME/.config/niri/config.kdl"; then
 // sky-status niri helper: basic desktop services
 spawn-at-startup "mako"
 spawn-at-startup "swaybg" "-c" "#202124"
+spawn-at-startup "waybar"
+spawn-at-startup "xwayland-satellite"
+spawn-at-startup "/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1"
 KDL
 fi
 
