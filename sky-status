@@ -51,9 +51,9 @@ TRANSPARENCY_LABELS = {
     5: "0.6–0.7", 6: "0.7–0.85", 7: "0.85–1.0", 8: ">1.0",
 }
 PHASES = [
-    ("🌑", "New Moon"), ("🌒", "Waxing Crescent"), ("🌓", "First Quarter"),
-    ("🌔", "Waxing Gibbous"), ("🌕", "Full Moon"), ("🌖", "Waning Gibbous"),
-    ("🌗", "Last Quarter"), ("🌘", "Waning Crescent"),
+    ("🌑", "New Moon"), ("🌘", "Waxing Crescent"), ("🌗", "First Quarter"),
+    ("🌖", "Waxing Gibbous"), ("🌕", "Full Moon"), ("🌔", "Waning Gibbous"),
+    ("🌓", "Last Quarter"), ("🌒", "Waning Crescent"),
 ]
 
 
