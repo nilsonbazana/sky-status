@@ -329,7 +329,21 @@ def moon_data(now_local):
     previous_new = ephem.previous_new_moon(now_ephem)
     next_new = ephem.next_new_moon(now_ephem)
     fraction = float(now_ephem - previous_new) / float(next_new - previous_new)
-    icon, phase_name = PHASES[int(fraction * 8 + 0.5) % 8]
+    idx = int(fraction * 8 + 0.5) % 8
+    icon, phase_name = PHASES[idx]
+
+    # In the Southern Hemisphere, flip the illumination side
+    if LAT < 0:
+        southern_icons = {
+            "🌒": "🌘",
+            "🌓": "🌗",
+            "🌔": "🌖",
+            "🌖": "🌔",
+            "🌗": "🌓",
+            "🌘": "🌒",
+        }
+        icon = southern_icons.get(icon, icon)
+
     moon = ephem.Moon(now_ephem)
 
     obs = ephem.Observer()
